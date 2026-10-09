@@ -4,7 +4,10 @@ Description: VPC with a public WordPress server and private MySQL database.
 Parameters:
   WordPressAmiId:
     Type: AWS::EC2::Image::Id
-    Description: Custom AMI with WordPress, Apache, PHP, and AWS CLI installed, but no database credentials.
+    Description: Custom AMI with WordPress, Apache, PHP with phpredis, AWS CLI, HyperDB 1.9 at /opt/hyperdb/db.php, and Redis Object Cache plugin at /opt/redis/redis-cache; no database or Redis credentials.
+  DatabaseMasterSecretArn:
+    Type: String
+    Description: ARN of the existing RDS-managed master secret to copy before disabling RDS-managed password management.
 
 Resources:
   VPC:
@@ -201,8 +204,19 @@ Resources:
         - Key: Name
           Value: ecommerce-database-subnets
 
+  DatabaseCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/database-credentials"
+      Description: Static copy of the existing RDS master credentials used by WordPress and the RDS primary. Manage password changes and rotation for this secret manually.
+      SecretString: !Sub "{{resolve:secretsmanager:${DatabaseMasterSecretArn}:SecretString}}"
+      Tags:
+        - Key: Name
+          Value: ecommerce-database-credentials
+
   MySQLDatabase:
     Type: AWS::RDS::DBInstance
+    DependsOn: DatabaseCredentialsSecret
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
     Properties:
@@ -213,7 +227,9 @@ Resources:
       StorageType: gp3
       StorageEncrypted: true
       MasterUsername: ecommerce_admin
-      ManageMasterUserPassword: true
+      ManageMasterUserPassword: false
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DatabaseCredentialsSecret}:SecretString:password}}"
+      ApplyImmediately: true
       DBSubnetGroupName: !Ref DatabaseSubnetGroup
       VPCSecurityGroups:
         - !GetAtt DatabaseSecurityGroup.GroupId
@@ -224,6 +240,76 @@ Resources:
         - Key: Name
           Value: ecommerce-mysql
 
+  MySQLReadReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      SourceDBInstanceIdentifier: !Ref MySQLDatabase
+      DBInstanceClass: db.t3.micro
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: ecommerce-mysql-read-replica
+
+  WordPressRedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redis TLS connections only from WordPress instances.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !GetAtt WordPressInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-redis-sg
+
+  WordPressRedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private server subnets across two Availability Zones for WordPress Redis.
+      SubnetIds:
+        - !Ref ServerSubnetA
+        - !Ref ServerSubnetB
+      CacheSubnetGroupName: !Sub "${AWS::StackName}-wordpress-redis"
+
+  WordPressRedisAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/redis-auth"
+      Description: Redis authentication token used by the private WordPress object cache.
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-redis-auth
+
+  WordPressRedisCache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    DependsOn: WordPressRedisAuthSecret
+    Properties:
+      ReplicationGroupDescription: Private encrypted Redis object cache for WordPress.
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheClusters: 2
+      Port: 6379
+      CacheSubnetGroupName: !Ref WordPressRedisSubnetGroup
+      SecurityGroupIds:
+        - !GetAtt WordPressRedisSecurityGroup.GroupId
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      AuthToken: !Sub "{{resolve:secretsmanager:${WordPressRedisAuthSecret}:SecretString}}"
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-redis
+
   WordPressLoadBalancerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -233,7 +319,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 0.0.0.0/0
+          SourcePrefixListId: pl-3b927c52
       Tags:
         - Key: Name
           Value: ecommerce-wordpress-alb-sg
@@ -336,7 +422,12 @@ Resources:
             Principal: "*"
             Action:
               - secretsmanager:GetSecretValue
-            Resource: !GetAtt MySQLDatabase.MasterUserSecret.SecretArn
+            Resource: !Ref DatabaseCredentialsSecret
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref WordPressRedisAuthSecret
 
   WordPressInstanceRole:
     Type: AWS::IAM::Role
@@ -351,14 +442,18 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
-        - PolicyName: ReadDatabaseCredentials
+        - PolicyName: ReadApplicationSecrets
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !GetAtt MySQLDatabase.MasterUserSecret.SecretArn
+                Resource: !Ref DatabaseCredentialsSecret
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WordPressRedisAuthSecret
 
   WordPressInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -440,6 +535,34 @@ Resources:
               fi
             '
 
+            if [ ! -s /opt/hyperdb/db.php ] || ! grep -q 'class hyperdb' /opt/hyperdb/db.php; then
+              echo "The AMI must include the HyperDB db.php drop-in at /opt/hyperdb/db.php." >&2
+              exit 1
+            fi
+            hyperdb_tmp="/mnt/wordpress-efs/wp-content/db.php.tmp.$$"
+            install -o apache -g apache -m 0644 /opt/hyperdb/db.php "$hyperdb_tmp"
+            mv -f "$hyperdb_tmp" /mnt/wordpress-efs/wp-content/db.php
+
+            if ! php -m | grep -iq '^redis$'; then
+              echo "The AMI must include the PHP Redis extension (phpredis)." >&2
+              exit 1
+            fi
+            if [ ! -s /opt/redis/redis-cache/includes/object-cache.php ] || [ ! -s /opt/redis/redis-cache/redis-cache.php ]; then
+              echo "The AMI must include the Redis Object Cache plugin at /opt/redis/redis-cache." >&2
+              exit 1
+            fi
+            mkdir -p /mnt/wordpress-efs/wp-content/plugins
+            redis_plugin_tmp="/mnt/wordpress-efs/wp-content/plugins/redis-cache.tmp.$$"
+            rm -rf "$redis_plugin_tmp"
+            install -d -o apache -g apache -m 0755 "$redis_plugin_tmp"
+            cp -a /opt/redis/redis-cache/. "$redis_plugin_tmp/"
+            chown -R apache:apache "$redis_plugin_tmp"
+            rm -rf /mnt/wordpress-efs/wp-content/plugins/redis-cache
+            mv "$redis_plugin_tmp" /mnt/wordpress-efs/wp-content/plugins/redis-cache
+            redis_cache_tmp="/mnt/wordpress-efs/wp-content/object-cache.php.tmp.$$"
+            install -o apache -g apache -m 0644 /opt/redis/redis-cache/includes/object-cache.php "$redis_cache_tmp"
+            mv -f "$redis_cache_tmp" /mnt/wordpress-efs/wp-content/object-cache.php
+
             if ! mountpoint -q /var/www/html/wp-content; then
               mount --bind /mnt/wordpress-efs/wp-content /var/www/html/wp-content
             fi
@@ -454,7 +577,7 @@ Resources:
             for attempt in $(seq 1 12); do
               if DB_SECRET_JSON=$(aws secretsmanager get-secret-value \
                 --region ${AWS::Region} \
-                --secret-id ${MySQLDatabase.MasterUserSecret.SecretArn} \
+                --secret-id ${DatabaseCredentialsSecret} \
                 --query SecretString \
                 --output text); then
                 break
@@ -466,13 +589,29 @@ Resources:
               sleep 10
             done
 
-            DB_SECRET_JSON="$DB_SECRET_JSON" python3 - <<'PY'
+            for attempt in $(seq 1 12); do
+              if REDIS_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
+                --region ${AWS::Region} \
+                --secret-id ${WordPressRedisAuthSecret} \
+                --query SecretString \
+                --output text); then
+                break
+              fi
+              if [ "$attempt" -eq 12 ]; then
+                echo "Unable to retrieve the Redis authentication token from Secrets Manager." >&2
+                exit 1
+              fi
+              sleep 10
+            done
+
+            DB_SECRET_JSON="$DB_SECRET_JSON" REDIS_AUTH_TOKEN="$REDIS_AUTH_TOKEN" python3 - <<'PY'
             import hashlib
             import hmac
             import json
             import os
 
             credentials = json.loads(os.environ["DB_SECRET_JSON"])
+            redis_auth_token = os.environ["REDIS_AUTH_TOKEN"]
 
             def php_string(value):
                 return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
@@ -482,6 +621,18 @@ Resources:
                 "DB_USER": credentials["username"],
                 "DB_PASSWORD": credentials["password"],
                 "DB_HOST": "${MySQLDatabase.Endpoint.Address}",
+                "DB_READ_HOST": "${MySQLReadReplica.Endpoint.Address}",
+                "WP_CACHE": "true",
+                "WP_REDIS_HOST": "${WordPressRedisCache.PrimaryEndPoint.Address}",
+                "WP_REDIS_PORT": "6379",
+                "WP_REDIS_PASSWORD": redis_auth_token,
+                "WP_REDIS_SCHEME": "tls",
+                "WP_REDIS_DATABASE": "0",
+                "WP_REDIS_PREFIX": "ecommerce:",
+                "WP_REDIS_TIMEOUT": "2",
+                "WP_REDIS_READ_TIMEOUT": "2",
+                "WP_HOME": "https://${WordPressCloudFrontDistribution.DomainName}",
+                "WP_SITEURL": "https://${WordPressCloudFrontDistribution.DomainName}",
                 "DB_CHARSET": "utf8mb4",
                 "DB_COLLATE": "",
             }
@@ -498,13 +649,45 @@ Resources:
                 config.write("<?php\n")
                 config.write("$table_prefix = 'wp_';\n")
                 for name, value in values.items():
-                    config.write(f"define( '{name}', {php_string(value)} );\n")
+                    if name == "WP_CACHE":
+                        config.write("define( 'WP_CACHE', true );\n")
+                    else:
+                        config.write(f"define( '{name}', {php_string(value)} );\n")
+                config.write("define( 'DB_CONFIG_FILE', '/etc/wordpress/db-config.php' );\n")
+                config.write("define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );\n")
+                config.write("if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && 'https' === strtolower( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) ) { $_SERVER['HTTPS'] = 'on'; }\n")
                 config.write("if ( ! defined( 'ABSPATH' ) ) { define( 'ABSPATH', __DIR__ . '/' ); }\n")
                 config.write("require_once ABSPATH . 'wp-settings.php';\n")
+
+            os.makedirs("/etc/wordpress", mode=0o750, exist_ok=True)
+            with open("/etc/wordpress/db-config.php", "w", encoding="utf-8") as config:
+                config.write("<?php\n")
+                config.write("// Replica reads are preferred; HyperDB keeps reads after writes on the primary for this request.\n")
+                config.write("$wpdb->add_database(array(\n")
+                config.write("    'host' => DB_HOST,\n")
+                config.write("    'user' => DB_USER,\n")
+                config.write("    'password' => DB_PASSWORD,\n")
+                config.write("    'name' => DB_NAME,\n")
+                config.write("    'write' => 1,\n")
+                config.write("    'read' => 2,\n")
+                config.write("    'dataset' => 'global',\n")
+                config.write("));\n")
+                config.write("$wpdb->add_database(array(\n")
+                config.write("    'host' => DB_READ_HOST,\n")
+                config.write("    'user' => DB_USER,\n")
+                config.write("    'password' => DB_PASSWORD,\n")
+                config.write("    'name' => DB_NAME,\n")
+                config.write("    'write' => 0,\n")
+                config.write("    'read' => 1,\n")
+                config.write("    'dataset' => 'global',\n")
+                config.write("));\n")
             PY
 
             chown apache:apache /var/www/html/wp-config.php
             chmod 640 /var/www/html/wp-config.php
+            chown -R apache:apache /etc/wordpress
+            chmod 750 /etc/wordpress
+            chmod 640 /etc/wordpress/db-config.php
             systemctl enable --now php-fpm
             systemctl enable --now httpd
             systemctl restart httpd
@@ -539,6 +722,106 @@ Resources:
       Tags:
         - Key: Name
           Value: ecommerce-wordpress-alb
+
+  WordPressCloudFrontWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: ecommerce-wordpress-cloudfront-web-acl
+      Description: AWS managed common rules including cross-site scripting protection, plus SQL injection protection for the WordPress CloudFront distribution.
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: ecommerce-wordpress-cloudfront-web-acl
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+            SampledRequestsEnabled: true
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+            SampledRequestsEnabled: true
+
+  WordPressCloudFrontOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: ecommerce-wordpress-origin-request-policy
+        Comment: Forward WordPress host, viewer HTTPS indicator, queries, and cookies to the ALB.
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - Host
+            - CloudFront-Forwarded-Proto
+            - X-Forwarded-For
+        CookiesConfig:
+          CookieBehavior: all
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  WordPressCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CloudFront distribution for the ecommerce WordPress site.
+        HttpVersion: http2
+        IPV6Enabled: true
+        WebACLId: !GetAtt WordPressCloudFrontWebACL.Arn
+        Origins:
+          - Id: WordPressApplicationLoadBalancer
+            DomainName: !GetAtt WordPressLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: WordPressApplicationLoadBalancer
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: !Ref WordPressCloudFrontOriginRequestPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
 
   WordPressHttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -586,6 +869,65 @@ Resources:
         PredefinedMetricSpecification:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: 70
+
+  WordPressBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub "${AWS::StackName}-daily-30-day"
+      BackupVaultTags:
+        Name: ecommerce-daily-30-day-backups
+
+  WordPressBackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+  WordPressBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${AWS::StackName}-daily-30-day"
+        BackupPlanRule:
+          - RuleName: DailyBackupRetain30Days
+            TargetBackupVault: !Ref WordPressBackupVault
+            ScheduleExpression: "cron(0 5 * * ? *)"
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 360
+            Lifecycle:
+              DeleteAfterDays: 30
+      BackupPlanTags:
+        Name: ecommerce-daily-30-day-backup-plan
+
+  DatabaseAndFileSystemBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref WordPressBackupPlan
+      BackupSelection:
+        SelectionName: ecommerce-database-and-efs
+        IamRoleArn: !GetAtt WordPressBackupRole.Arn
+        Resources:
+          - !GetAtt MySQLDatabase.DBInstanceArn
+          - !Sub "arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${WordPressFileSystem}"
+
+  WordPressInstanceBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref WordPressBackupPlan
+      BackupSelection:
+        SelectionName: ecommerce-wordpress-ec2-instances
+        IamRoleArn: !GetAtt WordPressBackupRole.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: Name
+            ConditionValue: ecommerce-wordpress
 
   EcommerceDashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -656,14 +998,41 @@ Outputs:
     Description: Name of the CloudWatch dashboard for WordPress and RDS metrics.
     Value: !Ref EcommerceDashboard
   WordPressUrl:
-    Description: HTTP URL for the WordPress load balancer.
+    Description: HTTPS URL for the WordPress CloudFront distribution.
+    Value: !Sub "https://${WordPressCloudFrontDistribution.DomainName}"
+  WordPressLoadBalancerUrl:
+    Description: HTTP origin endpoint restricted to CloudFront origin-facing IP ranges.
     Value: !Sub "http://${WordPressLoadBalancer.DNSName}"
+  CloudFrontDistributionId:
+    Description: ID of the WordPress CloudFront distribution.
+    Value: !Ref WordPressCloudFrontDistribution
+  CloudFrontWebACLArn:
+    Description: ARN of the CloudFront WAF web ACL protecting the WordPress site with AWS managed cross-site scripting and SQL injection rules.
+    Value: !GetAtt WordPressCloudFrontWebACL.Arn
   DatabaseEndpoint:
     Description: Private DNS endpoint for the MySQL database.
     Value: !GetAtt MySQLDatabase.Endpoint.Address
+  DatabaseReadReplicaEndpoint:
+    Description: Private DNS endpoint for the MySQL read replica.
+    Value: !GetAtt MySQLReadReplica.Endpoint.Address
+  DatabaseReadReplicaAvailabilityZone:
+    Description: Availability Zone hosting the MySQL read replica.
+    Value: !GetAtt MySQLReadReplica.AvailabilityZone
   DatabasePort:
     Description: MySQL database port.
     Value: !GetAtt MySQLDatabase.Endpoint.Port
+  RedisPrimaryEndpoint:
+    Description: Private TLS endpoint for the WordPress Redis object cache.
+    Value: !GetAtt WordPressRedisCache.PrimaryEndPoint.Address
+  RedisPort:
+    Description: Port for the WordPress Redis object cache.
+    Value: !GetAtt WordPressRedisCache.PrimaryEndPoint.Port
+  BackupVaultName:
+    Description: Vault storing daily RDS, EFS, and EC2 backups for 30 days.
+    Value: !Ref WordPressBackupVault
+  BackupPlanId:
+    Description: ID of the daily 30-day backup plan.
+    Value: !Ref WordPressBackupPlan
   WordPressFileSystemId:
     Description: ID of the encrypted EFS file system shared by WordPress instances.
     Value: !Ref WordPressFileSystem

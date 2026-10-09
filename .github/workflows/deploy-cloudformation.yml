@@ -42,11 +42,31 @@ jobs:
             exit 1
           fi
 
+          DATABASE_MASTER_SECRET_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Parameters[?ParameterKey=='DatabaseMasterSecretArn'].ParameterValue | [0]" \
+            --output text 2>/dev/null || true)
+          if [ -z "$DATABASE_MASTER_SECRET_ARN" ] || [ "$DATABASE_MASTER_SECRET_ARN" = "None" ]; then
+            DATABASE_ID="ecommerce-vpc-mysqldatabase-ubustouuyxty"
+            DATABASE_MASTER_SECRET_ARN=$(aws rds describe-db-instances \
+              --db-instance-identifier "$DATABASE_ID" \
+              --region "$AWS_REGION" \
+              --query 'DBInstances[0].MasterUserSecret.SecretArn' \
+              --output text)
+          fi
+          if [ -z "$DATABASE_MASTER_SECRET_ARN" ] || [ "$DATABASE_MASTER_SECRET_ARN" = "None" ]; then
+            echo "::error::Could not find the RDS master secret ARN for $DATABASE_ID."
+            exit 1
+          fi
+
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
             --template-file template.yaml \
             --region "$AWS_REGION" \
             --role-arn arn:aws:iam::525391386782:role/EcommerceCloudFormationExecutionRole \
             --capabilities CAPABILITY_IAM \
-            --parameter-overrides "WordPressAmiId=$WORDPRESS_AMI_ID" \
+            --parameter-overrides \
+              "WordPressAmiId=$WORDPRESS_AMI_ID" \
+              "DatabaseMasterSecretArn=$DATABASE_MASTER_SECRET_ARN" \
             --no-fail-on-empty-changeset
