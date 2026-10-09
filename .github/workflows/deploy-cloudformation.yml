@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: ecommerce-cms-cloudformation-main
@@ -25,12 +26,12 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::525391386782:role/EcommerceGitHubActionsDeployRole
+          role-session-name: GitHubActionsCloudFormationDeploy
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Validate CloudFormation template
-        run: aws cloudformation validate-template --template-body file://template.yaml
+        run: aws cloudformation validate-template --template-body file://template.yaml --region "$AWS_REGION"
 
       - name: Deploy CloudFormation stack
         env:
@@ -44,6 +45,8 @@ jobs:
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
             --template-file template.yaml \
+            --region "$AWS_REGION" \
+            --role-arn arn:aws:iam::525391386782:role/EcommerceCloudFormationExecutionRole \
             --capabilities CAPABILITY_IAM \
             --parameter-overrides "WordPressAmiId=$WORDPRESS_AMI_ID" \
             --no-fail-on-empty-changeset
