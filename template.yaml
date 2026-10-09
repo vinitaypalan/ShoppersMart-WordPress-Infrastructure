@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: VPC with a public WordPress server and private MySQL database.
+
+Parameters:
+  WordPressAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Custom AMI with WordPress, Apache, PHP, and AWS CLI installed, but no database credentials.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: ecommerce-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ecommerce-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ecommerce-public-a
+        - Key: Tier
+          Value: public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ecommerce-public-b
+        - Key: Tier
+          Value: public
+
+  ServerSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ecommerce-servers-a
+        - Key: Tier
+          Value: servers
+
+  ServerSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ecommerce-servers-b
+        - Key: Tier
+          Value: servers
+
+  DatabaseSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ecommerce-databases-a
+        - Key: Tier
+          Value: databases
+
+  DatabaseSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ecommerce-databases-b
+        - Key: Tier
+          Value: databases
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ecommerce-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  ServerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ecommerce-servers-rt
+
+  ServerSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ServerSubnetA
+      RouteTableId: !Ref ServerRouteTable
+
+  ServerSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ServerSubnetB
+      RouteTableId: !Ref ServerRouteTable
+
+  DatabaseRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ecommerce-databases-rt
+
+  DatabaseSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetA
+      RouteTableId: !Ref DatabaseRouteTable
+
+  DatabaseSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetB
+      RouteTableId: !Ref DatabaseRouteTable
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL connections from the WordPress Auto Scaling Group.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt WordPressInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-database-sg
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets across two Availability Zones.
+      SubnetIds:
+        - !Ref DatabaseSubnetA
+        - !Ref DatabaseSubnetB
+      Tags:
+        - Key: Name
+          Value: ecommerce-database-subnets
+
+  MySQLDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBName: ecommerce
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: ecommerce_admin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      Tags:
+        - Key: Name
+          Value: ecommerce-mysql
+
+  WordPressLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow public HTTP access to the WordPress load balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-alb-sg
+
+  WordPressInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the load balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt WordPressLoadBalancerSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-instance-sg
+
+  WordPressEfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from WordPress instances to EFS.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt WordPressInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-efs-sg
+
+  WordPressFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: ecommerce-wordpress-content
+
+  WordPressEfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressFileSystem
+      SubnetId: !Ref ServerSubnetA
+      SecurityGroups:
+        - !GetAtt WordPressEfsSecurityGroup.GroupId
+
+  WordPressEfsMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressFileSystem
+      SubnetId: !Ref ServerSubnetB
+      SecurityGroups:
+        - !GetAtt WordPressEfsSecurityGroup.GroupId
+
+  WordPressS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref ServerRouteTable
+
+  SecretsManagerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from WordPress instances to the Secrets Manager VPC endpoint.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt WordPressInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-secrets-endpoint-sg
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ServerSubnetA
+        - !Ref ServerSubnetB
+      SecurityGroupIds:
+        - !GetAtt SecretsManagerEndpointSecurityGroup.GroupId
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !GetAtt MySQLDatabase.MasterUserSecret.SecretArn
+
+  WordPressInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadDatabaseCredentials
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt MySQLDatabase.MasterUserSecret.SecretArn
+
+  WordPressInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WordPressInstanceRole
+
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WordPressAmiId
+        InstanceType: t3.micro
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        IamInstanceProfile:
+          Name: !Ref WordPressInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt WordPressInstanceSecurityGroup.GroupId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+
+            dnf install -y nfs-utils
+            mkdir -p /mnt/wordpress-efs /var/www/html/wp-content
+            imds_token=""
+            instance_az=""
+            for attempt in $(seq 1 12); do
+              if imds_token=$(curl --noproxy '*' --connect-timeout 2 --max-time 5 -fsS -X PUT \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                http://169.254.169.254/latest/api/token) && \
+                instance_az=$(curl --noproxy '*' --connect-timeout 2 --max-time 5 -fsS \
+                  -H "X-aws-ec2-metadata-token: $imds_token" \
+                  http://169.254.169.254/latest/meta-data/placement/availability-zone); then
+                break
+              fi
+              imds_token=""
+              instance_az=""
+              sleep 5
+            done
+            if [ -z "$instance_az" ]; then
+              echo "Unable to determine the instance Availability Zone from IMDSv2." >&2
+              exit 1
+            fi
+            case "$instance_az" in
+              "${ServerSubnetA.AvailabilityZone}")
+                efs_mount_target="${WordPressEfsMountTargetA.IpAddress}"
+                ;;
+              "${ServerSubnetB.AvailabilityZone}")
+                efs_mount_target="${WordPressEfsMountTargetB.IpAddress}"
+                ;;
+              *)
+                echo "No EFS mount target is configured for Availability Zone $instance_az." >&2
+                exit 1
+                ;;
+            esac
+            mount_options="nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport"
+            for attempt in $(seq 1 12); do
+              if mount -t nfs4 -o "$mount_options" "$efs_mount_target:/" /mnt/wordpress-efs; then
+                break
+              fi
+              if [ "$attempt" -eq 12 ]; then
+                echo "Unable to mount the WordPress EFS file system." >&2
+                exit 1
+              fi
+              sleep 10
+            done
+
+            touch /mnt/wordpress-efs/.wp-content-init.lock
+            flock -x /mnt/wordpress-efs/.wp-content-init.lock -c '
+              if [ ! -f /mnt/wordpress-efs/.wp-content-initialized ]; then
+                mkdir -p /mnt/wordpress-efs/wp-content
+                cp -a /var/www/html/wp-content/. /mnt/wordpress-efs/wp-content/
+                chown -R apache:apache /mnt/wordpress-efs/wp-content
+                touch /mnt/wordpress-efs/.wp-content-initialized
+              fi
+            '
+
+            if ! mountpoint -q /var/www/html/wp-content; then
+              mount --bind /mnt/wordpress-efs/wp-content /var/www/html/wp-content
+            fi
+            mountpoint -q /mnt/wordpress-efs
+            mountpoint -q /var/www/html/wp-content
+            echo "EFS mounted at /mnt/wordpress-efs and /var/www/html/wp-content from $efs_mount_target"
+            grep -qF "$efs_mount_target:/" /etc/fstab || \
+              printf '%s\n' "$efs_mount_target:/ /mnt/wordpress-efs nfs4 $mount_options,_netdev 0 0" >> /etc/fstab
+            grep -qF '/mnt/wordpress-efs/wp-content /var/www/html/wp-content' /etc/fstab || \
+              printf '%s\n' '/mnt/wordpress-efs/wp-content /var/www/html/wp-content none bind,_netdev 0 0' >> /etc/fstab
+
+            for attempt in $(seq 1 12); do
+              if DB_SECRET_JSON=$(aws secretsmanager get-secret-value \
+                --region ${AWS::Region} \
+                --secret-id ${MySQLDatabase.MasterUserSecret.SecretArn} \
+                --query SecretString \
+                --output text); then
+                break
+              fi
+              if [ "$attempt" -eq 12 ]; then
+                echo "Unable to retrieve the RDS credentials from Secrets Manager." >&2
+                exit 1
+              fi
+              sleep 10
+            done
+
+            DB_SECRET_JSON="$DB_SECRET_JSON" python3 - <<'PY'
+            import hashlib
+            import hmac
+            import json
+            import os
+
+            credentials = json.loads(os.environ["DB_SECRET_JSON"])
+
+            def php_string(value):
+                return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+            values = {
+                "DB_NAME": "ecommerce",
+                "DB_USER": credentials["username"],
+                "DB_PASSWORD": credentials["password"],
+                "DB_HOST": "${MySQLDatabase.Endpoint.Address}",
+                "DB_CHARSET": "utf8mb4",
+                "DB_COLLATE": "",
+            }
+            for name in (
+                "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY",
+                "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT",
+            ):
+                message = f"wordpress:{name}".encode()
+                values[name] = hmac.new(
+                    credentials["password"].encode(), message, hashlib.sha256
+                ).hexdigest()
+
+            with open("/var/www/html/wp-config.php", "w", encoding="utf-8") as config:
+                config.write("<?php\n")
+                config.write("$table_prefix = 'wp_';\n")
+                for name, value in values.items():
+                    config.write(f"define( '{name}', {php_string(value)} );\n")
+                config.write("if ( ! defined( 'ABSPATH' ) ) { define( 'ABSPATH', __DIR__ . '/' ); }\n")
+                config.write("require_once ABSPATH . 'wp-settings.php';\n")
+            PY
+
+            chown apache:apache /var/www/html/wp-config.php
+            chmod 640 /var/www/html/wp-config.php
+            systemctl enable --now php-fpm
+            systemctl enable --now httpd
+            systemctl restart httpd
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200-399"
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-tg
+
+  WordPressLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !GetAtt WordPressLoadBalancerSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress-alb
+
+  WordPressHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - WordPressHttpListener
+      - WordPressEfsMountTargetA
+      - WordPressEfsMountTargetB
+      - WordPressS3Endpoint
+    Properties:
+      MinSize: "2"
+      MaxSize: "3"
+      DesiredCapacity: "2"
+      VPCZoneIdentifier:
+        - !Ref ServerSubnetA
+        - !Ref ServerSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Name
+          Value: ecommerce-wordpress
+          PropagateAtLaunch: true
+
+  WordPressCpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 300
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70
+
+  EcommerceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Ecommerce-CMS
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "WordPress EC2 Average CPU Utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Average",
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${WordPressAutoScalingGroup}", { "stat": "Average", "label": "ASG average CPU" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "RDS MySQL CPU Utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Average",
+                "metrics": [
+                  [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${MySQLDatabase}", { "stat": "Average", "label": "RDS CPU" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Application Load Balancer Requests",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${WordPressLoadBalancer.LoadBalancerFullName}", { "stat": "Sum", "label": "Requests" } ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VpcId:
+    Description: ID of the created VPC.
+    Value: !Ref VPC
+  CloudWatchDashboardName:
+    Description: Name of the CloudWatch dashboard for WordPress and RDS metrics.
+    Value: !Ref EcommerceDashboard
+  WordPressUrl:
+    Description: HTTP URL for the WordPress load balancer.
+    Value: !Sub "http://${WordPressLoadBalancer.DNSName}"
+  DatabaseEndpoint:
+    Description: Private DNS endpoint for the MySQL database.
+    Value: !GetAtt MySQLDatabase.Endpoint.Address
+  DatabasePort:
+    Description: MySQL database port.
+    Value: !GetAtt MySQLDatabase.Endpoint.Port
+  WordPressFileSystemId:
+    Description: ID of the encrypted EFS file system shared by WordPress instances.
+    Value: !Ref WordPressFileSystem
+  PublicSubnetIds:
+    Description: Public subnet IDs in Availability Zones A and B.
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+  ServerSubnetIds:
+    Description: Private server subnet IDs in Availability Zones A and B.
+    Value: !Join [",", [!Ref ServerSubnetA, !Ref ServerSubnetB]]
+  DatabaseSubnetIds:
+    Description: Private database subnet IDs in Availability Zones A and B.
+    Value: !Join [",", [!Ref DatabaseSubnetA, !Ref DatabaseSubnetB]]

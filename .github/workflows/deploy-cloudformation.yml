@@ -1,0 +1,49 @@
+name: Deploy CloudFormation
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecommerce-cms-cloudformation-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      WORDPRESS_AMI_ID: ${{ secrets.WORDPRESS_AMI_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Validate CloudFormation template
+        run: aws cloudformation validate-template --template-body file://template.yaml
+
+      - name: Deploy CloudFormation stack
+        env:
+          STACK_NAME: ecommerce-vpc
+        run: |
+          if [ -z "$WORDPRESS_AMI_ID" ]; then
+            echo "::error::Set the WORDPRESS_AMI_ID repository secret to the custom WordPress AMI ID."
+            exit 1
+          fi
+
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file template.yaml \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides "WordPressAmiId=$WORDPRESS_AMI_ID" \
+            --no-fail-on-empty-changeset
